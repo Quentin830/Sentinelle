@@ -1,4 +1,4 @@
-# Amphiwaste
+# Sentinelle
 
 Un robot tout-terrain capable de se déplacer sur terre grâce à des chenilles, et de naviguer sur l'eau grâce à une coque de bateau intégrée. Ce projet combine la robotique mobile, la mécanique, l’électronique et la programmation embarquée pour créer un système télécommandé.
 

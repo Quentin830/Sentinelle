@@ -1,5 +1,9 @@
 4 moteurs DC : IP68, 12V, 60W, 420RPM
 2 moteurs brushless : 12V, 20A
 2 Pont en H : MD10C Cytron technologies
-Batterie : Li-po 5200mAh, 11.1V
+2 Batterie : Li-po 5200mAh, 11.1V
 2 ESC bidirectionnel : 40A
+Carte Nvidia jetson nano
+Convertisseur buck usb
+IMU 9 axes MPU 9050
+Module gps neo 10M

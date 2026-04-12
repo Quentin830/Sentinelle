@@ -1,0 +1,409 @@
+import cv2
+import numpy as np
+import serial
+import time
+import threading
+import math
+import onnxruntime as ort
+from flask import Flask, Response, render_template_string, jsonify
+
+# --- VARIABLES GLOBALES ---
+proba_eau_globale = 0.0
+frame_pour_eau = None
+frame_stream = None
+analyse_active = True
+
+etat_robot = {
+    "mode_terrain": "TERRE",
+    "statut_ia": "INITIALISATION...",
+    "direction": 1500,
+    "vitesse": 1500,
+    "latitude": 0.0,
+    "longitude": 0.0,
+    "cap": 0
+}
+
+
+# ==========================================
+# 0. LE FILTRE DE FUSION DE CAPTEURS (GPS + IMU)
+# ==========================================
+class RobotPosition:
+    def __init__(self):
+        self.lat = 0.0
+        self.lon = 0.0
+        self.last_time = time.time()
+        self.m_to_lat = 1.0 / 111111.0
+        self.premier_fix = False
+
+    def update(self, gps_lat, gps_lon, acc_x, acc_y):
+        current_time = time.time()
+        dt = current_time - self.last_time
+        self.last_time = current_time
+        ALPHA = 0.95
+
+        # Si le GPS est à 0 (pas de signal), on ne fait rien pour l'instant
+        if gps_lat == 0.0 and not self.premier_fix:
+            return 0.0, 0.0
+
+        if gps_lat != 0.0 and not self.premier_fix:
+            self.lat = gps_lat
+            self.lon = gps_lon
+            self.premier_fix = True
+
+        dist_x = 0.5 * acc_x * (dt ** 2)
+        pred_lat = self.lat + (dist_x * self.m_to_lat)
+
+        if gps_lat != 0.0:
+            self.lat = (ALPHA * gps_lat) + ((1 - ALPHA) * pred_lat)
+            self.lon = gps_lon
+        else:
+            self.lat = pred_lat
+
+        return self.lat, self.lon
+
+
+filtre_position = RobotPosition()
+
+# ==========================================
+# 1. LE SERVEUR WEB (DASHBOARD + CARTE GPS LEAFLET)
+# ==========================================
+app = Flask(__name__)
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Robot IA Dashboard</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+    <style>
+        body { background-color: #121212; color: #ffffff; font-family: 'Segoe UI', sans-serif; margin: 0; padding: 10px; }
+        h2 { text-align: center; color: #00ffcc; text-transform: uppercase; margin-top: 5px; font-size: 1.2em; letter-spacing: 2px;}
+        .video-container { width: 100%; max-width: 500px; margin: 0 auto; border-radius: 12px; overflow: hidden; border: 2px solid #333; box-shadow: 0 0 10px rgba(0, 255, 204, 0.2); }
+        img { width: 100%; display: block; }
+
+        .telemetry { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; max-width: 500px; margin: 15px auto; }
+        .card { background: #1e1e1e; padding: 10px; border-radius: 8px; text-align: center; border-top: 2px solid #333;}
+        .title { font-size: 0.7em; color: #aaaaaa; text-transform: uppercase; }
+        .value { font-size: 1.1em; font-weight: bold; margin-top: 5px; }
+
+        #map { height: 250px; width: 100%; max-width: 500px; margin: 0 auto; border-radius: 12px; border: 2px solid #333; z-index: 1;}
+        .icon-robot { font-size: 24px; text-align: center; line-height: 24px; transition: transform 0.2s;}
+    </style>
+</head>
+<body>
+    <h2>Télémétrie & Navigation</h2>
+
+    <div class="video-container">
+        <img src="/video_feed" alt="Flux vidéo">
+    </div>
+
+    <div class="telemetry">
+        <div class="card" style="border-top-color: #ff9900;"><div class="title">Environnement</div><div class="value" id="val-mode">--</div></div>
+        <div class="card" style="border-top-color: #00ff00;"><div class="title">Statut</div><div class="value" id="val-statut">--</div></div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+        var map = L.map('map').setView([0, 0], 2);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        var robotIcon = L.divIcon({
+            html: '<div id="robot-arrow" class="icon-robot">🚀</div>',
+            className: '',
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+        });
+        var marker = L.marker([0, 0], {icon: robotIcon}).addTo(map);
+        var firstLock = false;
+
+        setInterval(function() {
+            fetch('/telemetry')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('val-mode').innerText = data.mode_terrain;
+                    document.getElementById('val-statut').innerText = data.statut_ia;
+                    document.getElementById('val-mode').style.color = (data.mode_terrain === 'EAU') ? '#00ccff' : '#ff9900';
+                    document.getElementById('val-statut').style.color = (data.statut_ia.includes('SUIVI')) ? '#00ff00' : '#ffff00';
+
+                    // MISE À JOUR DE LA CARTE GPS
+                    if(data.latitude !== 0.0 && data.longitude !== 0.0) {
+                        marker.setLatLng([data.latitude, data.longitude]);
+
+                        if(!firstLock) {
+                            map.setView([data.latitude, data.longitude], 18);
+                            firstLock = true;
+                        }
+
+                        let arrow = document.getElementById('robot-arrow');
+                        if(arrow) {
+                            arrow.style.transform = `rotate(${data.cap}deg)`;
+                        }
+                    }
+                });
+        }, 200);
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_PAGE)
+
+
+@app.route('/telemetry')
+def telemetry():
+    return jsonify(etat_robot)
+
+
+def gen():
+    global frame_stream
+    dernier_envoi = time.time()
+    while True:
+        if frame_stream is None:
+            time.sleep(0.05)
+            continue
+        maintenant = time.time()
+        if maintenant - dernier_envoi < 0.08:
+            time.sleep(0.01)
+            continue
+        dernier_envoi = maintenant
+        frame_mini = cv2.resize(frame_stream, (320, 180))
+        ret, jpeg = cv2.imencode('.jpg', frame_mini, [int(cv2.IMWRITE_JPEG_QUALITY), 40])
+        if not ret: continue
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+def lancer_serveur():
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+
+
+# ==========================================
+# 2. LES CERVEAUX ARRIÈRE-PLAN (ONNX & SERIAL)
+# ==========================================
+def analyse_environnement_arriere_plan(session, input_name):
+    global proba_eau_globale, frame_pour_eau, analyse_active
+    while analyse_active:
+        if frame_pour_eau is not None:
+            try:
+                frame_resized = cv2.resize(frame_pour_eau, (224, 224))
+                blob_eau = cv2.dnn.blobFromImage(frame_resized, 1 / 255.0, (224, 224), mean=(0.485, 0.456, 0.406),
+                                                 swapRB=True, crop=False)
+                predictions = session.run(None, {input_name: blob_eau})[0]
+                proba_eau_globale = predictions[0][1]
+            except Exception as e:
+                pass
+        time.sleep(0.1)
+
+
+def ecouter_arduino(port_serie):
+    """Ce thread écoute l'Arduino, lit le GPS/IMU et passe les données dans ton filtre !"""
+    global etat_robot, analyse_active, filtre_position
+    while analyse_active:
+        if port_serie and port_serie.in_waiting > 0:
+            try:
+                ligne = port_serie.readline().decode('utf-8').strip()
+                donnees = ligne.split(',')
+
+                # Si on reçoit bien les 5 valeurs de l'Arduino
+                if len(donnees) >= 5:
+                    g_lat = float(donnees[0])
+                    g_lon = float(donnees[1])
+                    cap = int(donnees[2])
+                    ax = float(donnees[3])
+                    ay = float(donnees[4])
+
+                    # On passe le GPS brut dans le filtre avec l'IMU
+                    lat_filtree, lon_filtree = filtre_position.update(g_lat, g_lon, ax, ay)
+
+                    # On met à jour le tableau de bord avec les données lisses
+                    etat_robot['latitude'] = lat_filtree
+                    etat_robot['longitude'] = lon_filtree
+                    etat_robot['cap'] = cap
+
+            except Exception as e:
+                pass
+        time.sleep(0.05)
+
+
+# ==========================================
+# 3. LE PROGRAMME PRINCIPAL
+# ==========================================
+try:
+    arduino = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.1)
+    time.sleep(2)
+except:
+    arduino = None
+
+
+def suivre_humain():
+    global frame_pour_eau, frame_stream, analyse_active, proba_eau_globale, etat_robot
+
+    gstreamer_pipeline = (
+        "nvarguscamerasrc ! "
+        "video/x-raw(memory:NVMM), width=1280, height=720, format=(string)NV12, framerate=(fraction)30/1 ! "
+        "nvvidconv flip-method=0 ! "
+        "video/x-raw, width=480, height=270, format=(string)BGRx ! "
+        "videoconvert ! "
+        "video/x-raw, format=(string)BGR ! appsink drop=true max-buffers=1"
+    )
+    cap = cv2.VideoCapture(gstreamer_pipeline, cv2.CAP_GSTREAMER)
+
+    net = cv2.dnn.readNetFromDarknet('yolov3-tiny.cfg', 'yolov3-tiny.weights')
+    output_layers = net.getUnconnectedOutLayersNames()
+
+    session_eau = ort.InferenceSession('water_classifier.onnx')
+    input_name_eau = session_eau.get_inputs()[0].name
+
+    threading.Thread(target=analyse_environnement_arriere_plan, args=(session_eau, input_name_eau), daemon=True).start()
+    threading.Thread(target=lancer_serveur, daemon=True).start()
+    if arduino:
+        threading.Thread(target=ecouter_arduino, args=(arduino,), daemon=True).start()
+
+    compteur_images = 0
+    memoire_box = None
+    memoire_perte = 0
+    dernier_dir = 1500
+    dernier_acc = 1500
+    humain_detecte = False
+
+    temps_precedent = time.time()
+    erreur_precedente_x = 0
+    integrale_x = 0
+    erreur_precedente_z = 0
+    integrale_z = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+
+            (h, w) = frame.shape[:2]
+            compteur_images += 1
+            frame_pour_eau = frame
+
+            mode_pwm = 2000 if proba_eau_globale > 0.6 else 1000
+            etat_robot["mode_terrain"] = "EAU" if proba_eau_globale > 0.6 else "TERRE"
+
+            if compteur_images % 2 == 0:
+                humain_detecte = False
+                blob = cv2.dnn.blobFromImage(frame, 0.00392, (320, 320), (0, 0, 0), True, crop=False)
+                net.setInput(blob)
+                outs = net.forward(output_layers)
+
+                plus_gros_humain_surface = 0
+
+                for out in outs:
+                    for detection in out:
+                        scores = detection[5:]
+                        class_id = np.argmax(scores)
+                        confidence = scores[class_id]
+
+                        if confidence > 0.2 and class_id == 0:
+                            center_x = int(detection[0] * w)
+                            center_y = int(detection[1] * h)
+                            width_box = int(detection[2] * w)
+                            height_box = int(detection[3] * h)
+
+                            startX = int(center_x - width_box / 2)
+                            startY = int(center_y - height_box / 2)
+                            endX = startX + width_box
+                            endY = startY + height_box
+                            surface = width_box * height_box
+
+                            if surface > plus_gros_humain_surface:
+                                plus_gros_humain_surface = surface
+                                memoire_box = (startX, startY, endX, endY)
+                                humain_detecte = True
+
+            if humain_detecte and memoire_box is not None:
+                memoire_perte = 0
+                (startX, startY, endX, endY) = memoire_box
+                centre_humain_x = (startX + endX) // 2
+                largeur_humain = endX - startX
+                centre_image = w // 2
+
+                temps_actuel = time.time()
+                dt = max(temps_actuel - temps_precedent, 0.001)
+                temps_precedent = temps_actuel
+
+                erreur_x = centre_humain_x - centre_image
+                integrale_x += erreur_x * dt
+                derivee_x = (erreur_x - erreur_precedente_x) / dt
+                erreur_precedente_x = erreur_x
+
+                correction_x = (1.2 * erreur_x) + (0.0 * integrale_x) + (0.15 * derivee_x)
+                dir_pwm = int(1500 + correction_x)
+                dir_pwm = max(1100, min(1900, dir_pwm))
+
+                taille_cible = w * 0.40
+                erreur_z = taille_cible - largeur_humain
+
+                integrale_z += erreur_z * dt
+                derivee_z = (erreur_z - erreur_precedente_z) / dt
+                erreur_precedente_z = erreur_z
+
+                correction_z = (1.0 * erreur_z) + (0.0 * integrale_z) + (0.2 * derivee_z)
+                acc_pwm = int(1500 + correction_z)
+                acc_pwm = max(1350, min(1650, acc_pwm))
+
+                if 1470 < acc_pwm < 1530:
+                    acc_pwm = 1500
+
+                etat_robot["statut_ia"] = "SUIVI AUTO"
+
+                dernier_dir = dir_pwm
+                dernier_acc = acc_pwm
+
+                cv2.rectangle(frame, (startX, startY), (endX, endY), (0, 255, 0), 2)
+                cv2.drawMarker(frame, (centre_humain_x, (startY + endY) // 2), (0, 255, 0), cv2.MARKER_CROSS, 20, 2)
+
+            else:
+                memoire_perte += 1
+                if memoire_perte < 15:
+                    dir_pwm = dernier_dir
+                    acc_pwm = dernier_acc
+                    etat_robot["statut_ia"] = "RECHERCHE..."
+                    temps_precedent = time.time()
+                else:
+                    dir_pwm = 1500
+                    acc_pwm = 1500
+                    etat_robot["statut_ia"] = "ATTENTE CIBLE"
+                    erreur_precedente_x = 0
+                    erreur_precedente_z = 0
+                    integrale_x = 0
+                    integrale_z = 0
+
+            etat_robot["direction"] = dir_pwm
+            etat_robot["vitesse"] = acc_pwm
+
+            # Envoi des commandes Moteurs à l'Arduino
+            if arduino and (compteur_images % 2 == 0):
+                commande = f"{dir_pwm},{acc_pwm},{mode_pwm}\n"
+                arduino.write(commande.encode('utf-8'))
+
+            frame_stream = frame.copy()
+
+    finally:
+        analyse_active = False
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    suivre_humain()

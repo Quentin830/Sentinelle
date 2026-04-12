@@ -1,1 +1,443 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <math.h>
 
+// ==========================================
+// 🚨 INTERRUPTEUR DE SÉCURITÉ (DEBUG)
+// ==========================================
+// Laisse sur "false" pour le moment. 
+// Passe à "true" UNIQUEMENT quand le robot roule bien avec la télécommande !
+bool ACTIVER_IMU = true; 
+
+// --- Adresses IMU MPU9250 ---
+#define MPU9250_ADDR 0x68
+#define AK8963_ADDR  0x0C
+
+// --- Moteurs Bateaux (ESC) ---
+Servo esc1;
+Servo esc2;
+
+#define CHANNEL1 0
+#define CHANNEL2 1
+#define CHANNEL3 2
+
+#define ACCELERATION 1
+#define DIRECTION 2
+#define BOUTON 3
+
+// Variables pour le maritime
+volatile int helice_droite = 1500;
+volatile int helice_gauche = 1500;
+volatile bool avant = true; 
+volatile bool droite = true;
+volatile bool neutre_acceleration = true;
+volatile bool neutre_direction = true;
+
+// Variables RC (Interruptions)
+volatile unsigned long current_time;
+volatile unsigned long timer[3];
+volatile byte previous_state[3] = {LOW, LOW, LOW};
+volatile unsigned int pulse_duration[3] = {1500, 1500, 1000};
+int mode_mapping[3];
+
+// --- Moteurs Terrestres ---
+const int dir1 = 8;
+const int pwm1 = 3; // Pin 3 (Corrigé pour éviter le conflit avec les ESC)
+
+const int dir2 = 5;
+const int pwm2 = 6;
+
+volatile bool milieu = true;
+
+// --- Variables Jetson / Autopilote ---
+unsigned long dernier_message_jetson = 0;
+bool jetson_actif = false;
+int jetson_dir = 1500;
+int jetson_acc = 1500;
+int jetson_mode = 1000;
+
+// --- Variables Télémétrie (IMU) ---
+unsigned long dernier_envoi_telemetrie = 0;
+int cap_robot = 0; 
+float acc_x = 0.0;
+float acc_y = 0.0;
+
+// ==========================================
+// SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // Initialisation des broches moteurs terrestres
+  pinMode(dir1, OUTPUT);
+  pinMode(pwm1, OUTPUT);
+  pinMode(dir2, OUTPUT);
+  pinMode(pwm2, OUTPUT);
+
+  // 🛡️ SÉCURITÉ ANTI-DÉMARRAGE FOU : On s'assure que tout est coupé à l'allumage
+  digitalWrite(dir1, LOW);
+  digitalWrite(dir2, LOW);
+  analogWrite(pwm1, 0);
+  analogWrite(pwm2, 0);
+
+  // Configuration RC (Pins 2, 4, 7)
+  mode_mapping[ACCELERATION] = CHANNEL2;
+  mode_mapping[DIRECTION] = CHANNEL1;
+  mode_mapping[BOUTON] = CHANNEL3;
+
+  PCICR |= (1 << PCIE2);
+  PCMSK2 |= (1 << PCINT18);
+  PCMSK2 |= (1 << PCINT20);
+  PCMSK2 |= (1 << PCINT23);
+
+  // --- Initialisation conditionnelle du MPU9250 ---
+  if (ACTIVER_IMU) {
+    writeRegister(MPU9250_ADDR, 0x6B, 0x00); 
+    delay(100);
+    writeRegister(MPU9250_ADDR, 0x37, 0x02); 
+    delay(100);
+    writeRegister(AK8963_ADDR, 0x0A, 0x16);  
+    delay(100);
+  }
+
+  // Initialisation des ESC (Bateaux) - Placé à la fin car ils bloquent l'Arduino pendant 3 sec
+  esc1.attach(9);
+  esc2.attach(11);
+  esc1.writeMicroseconds(1000); 
+  esc2.writeMicroseconds(1000);
+  delay(1000);
+  esc1.writeMicroseconds(2000); 
+  esc2.writeMicroseconds(2000);
+  delay(1000);
+  esc1.writeMicroseconds(1000); 
+  esc2.writeMicroseconds(1000);
+  delay(1000);
+}
+
+// ==========================================
+// LOOP PRINCIPALE
+// ==========================================
+void loop() {
+  ecouter_jetson(); 
+  
+  if (ACTIVER_IMU) {
+    envoyer_telemetrie(); 
+  }
+  
+  choix_milieu();
+  
+  volatile int valeur_acceleration = acceleration();
+  volatile int valeur_direction = direction();
+  
+  controle_esc();
+  
+  if (milieu == true){
+    terrestre();
+    helice_droite = 1500;
+    helice_gauche = 1500;
+  } else {
+    maritime();
+    digitalWrite(dir1, LOW);
+    digitalWrite(dir2, LOW);
+    analogWrite(pwm1, 0);
+    analogWrite(pwm2, 0);
+  }
+}
+
+// ==========================================
+// FONCTIONS DE LECTURE RC ET FAILSAFE
+// ==========================================
+int acceleration() {
+  int valeur = jetson_actif ? jetson_acc : pulse_duration[1];
+  
+  // 🛡️ SÉCURITÉ : Si la RC est éteinte, on force l'arrêt
+  if (valeur < 800 || valeur > 2200) valeur = 1500;
+  
+  int reponse;
+  if ((valeur > 1450) && (valeur < 1650)) {
+    reponse = 0;
+    neutre_acceleration = true ;
+  }
+  else if (valeur > 1600) { 
+    avant = true;
+    neutre_acceleration = false ;
+    reponse = map(valeur, 1650, 2052, 0, 100);
+  }
+  else if (valeur < 1450) {
+    reponse = map(valeur, 1450, 1060, 0, 100);
+    neutre_acceleration = false ;
+    avant = false;
+  }
+  return constrain(reponse, 0, 100);
+}
+
+int direction() {
+  int valeur = jetson_actif ? jetson_dir : pulse_duration[0];
+
+  // 🛡️ SÉCURITÉ
+  if (valeur < 800 || valeur > 2200) valeur = 1500;
+
+  int reponse;
+  if ((valeur > 1500) && (valeur < 1600)) {
+    reponse = 0;
+    neutre_direction = true ;
+  }
+  else if (valeur > 1650) {
+    droite = true;
+    reponse = map(valeur, 1650, 2052, 0, 100);
+    neutre_direction = false ;
+  }
+  else if (valeur < 1450) {
+    reponse = map(valeur, 1450, 1060, 0, 100);
+    neutre_direction = false ;
+    droite = false;
+  }
+  return constrain(reponse, 0, 100);
+}
+
+void choix_milieu() {
+  int valeur = jetson_actif ? jetson_mode : pulse_duration[2];
+  if ((valeur < 1200) && (valeur > 800)) {
+    milieu = true ;
+  } else {
+    milieu = false ; 
+  }
+}
+
+// ==========================================
+// FONCTIONS DE CONTRÔLE MOTEURS
+// ==========================================
+void controle_esc(){
+  esc1.writeMicroseconds(helice_droite);
+  esc2.writeMicroseconds(helice_gauche);
+}
+
+void maritime() {
+  if (neutre_acceleration == true)  {
+    if (neutre_direction == true){
+      helice_droite = 1500;
+      helice_gauche = 1500;
+      return;
+    }
+    if ((neutre_direction == false) && (droite == true)){
+      helice_droite =  1500 - 500 * (direction() / 100.0);
+      helice_gauche = 1500 + 500 * (direction() / 100.0);
+    }
+    if ((neutre_direction == false) && (droite == false)) {
+      helice_droite =  1500 - 500 * (direction() / 100.0);
+      helice_gauche = 1500 + 500 * (direction() / 100.0);
+    }
+  }
+
+  if ((avant == true)  && (neutre_acceleration == false)) {
+    if (neutre_direction == true) {
+      helice_droite = 1500 + 500 * (acceleration() / 100.0);
+      helice_gauche = 1500 + 500 * (acceleration() / 100.0);
+    } 
+    if ((droite == true) && (neutre_direction == false)) {
+      helice_gauche = 1500 + 500 * (acceleration() / 100.0);
+      helice_droite = 1500 - 500 * (direction() / 100.0);
+    }
+    if ((droite == false) && (neutre_direction == false)){
+      helice_droite = 1500 + 500 * (acceleration() / 100.0);
+      helice_gauche = 1500 - 500 * (direction() / 100.0);
+    }
+  } 
+  
+  if ((avant == false) && (neutre_acceleration == false)) {
+    if (neutre_direction == true) {
+      helice_droite = 1500 - 500 * (acceleration() / 100.0);
+      helice_gauche = 1500 - 500 * (acceleration() / 100.0);
+    } 
+    if ((droite == true) && (neutre_direction == false)) {
+      helice_gauche = 1500 - 500 * (acceleration() / 100.0);
+      helice_droite = 1500 + 500 * (direction() / 100.0);
+    }
+    if ((droite == false) && (neutre_direction == false)){
+      helice_droite = 1500 - 500 * (acceleration() / 100.0);
+      helice_gauche = 1500 + 500 * (direction() / 100.0);
+    }
+  } 
+}
+
+void terrestre() {
+  int pwm_acc = map(acceleration(), 0, 100, 0, 255);
+  int pwm_dir = map(direction(), 0, 100, 0, 255);
+  
+  if (neutre_acceleration == true)  {
+    if (neutre_direction == true){
+      digitalWrite(dir1, LOW); // Sécurité : On coupe le sens
+      digitalWrite(dir2, LOW);
+      analogWrite(pwm1, 0);    // Sécurité : On coupe la puissance
+      analogWrite(pwm2, 0);
+      return;
+    }
+    if ((neutre_direction == false) && (droite == true)){
+      digitalWrite(dir1, HIGH);
+      digitalWrite(dir2, HIGH);
+      analogWrite(pwm1, pwm_dir);
+      analogWrite(pwm2, pwm_dir);
+    }
+    if ((neutre_direction == false) && (droite == false)) {
+      digitalWrite(dir1, LOW);
+      digitalWrite(dir2, LOW);
+      analogWrite(pwm1, pwm_dir);
+      analogWrite(pwm2, pwm_dir);
+    }
+  }
+
+  if ((avant == true)  && (neutre_acceleration == false)) {
+    if (neutre_direction == true) {
+      digitalWrite(dir1, LOW); 
+      digitalWrite(dir2, HIGH);
+      analogWrite(pwm1, pwm_acc); 
+      analogWrite(pwm2, pwm_acc);
+    } 
+    if ((droite == true) && (neutre_direction == false)) {
+      digitalWrite(dir1, LOW); 
+      digitalWrite(dir2, LOW);
+      analogWrite(pwm1, pwm_acc);
+      analogWrite(pwm2, pwm_dir);
+    }
+    if ((droite == false) && (neutre_direction == false)){
+      digitalWrite(dir1, HIGH);
+      digitalWrite(dir2, HIGH);
+      analogWrite(pwm1, pwm_dir);
+      analogWrite(pwm2, pwm_acc);
+    }
+  } 
+  
+  if ((avant == false)  && (neutre_acceleration == false)) {
+    if (neutre_direction == true) {
+      digitalWrite(dir1, HIGH);
+      digitalWrite(dir2, LOW);
+      analogWrite(pwm1, pwm_acc);
+      analogWrite(pwm2, pwm_acc);
+    } 
+    if ((droite == true) && (neutre_direction == false)) {
+      digitalWrite(dir1, HIGH);
+      digitalWrite(dir2, HIGH);
+      analogWrite(pwm1, pwm_acc);
+      analogWrite(pwm2, pwm_dir);
+    }
+    if ((droite == false) && (neutre_direction == false)){
+      digitalWrite(dir1, LOW);
+      digitalWrite(dir2, LOW);
+      analogWrite(pwm1, pwm_dir);
+      analogWrite(pwm2, pwm_acc);
+    }
+  } 
+}
+
+// ==========================================
+// LECTURE TÉLÉCOMMANDE (INTERRUPTIONS)
+// ==========================================
+ISR(PCINT2_vect) {
+  current_time = micros();
+
+  if (PIND & (1 << PD2)) {
+    if (previous_state[CHANNEL1] == LOW) {
+      previous_state[CHANNEL1] = HIGH;
+      timer[CHANNEL1] = current_time;
+    }
+  } else if (previous_state[CHANNEL1] == HIGH) {
+    previous_state[CHANNEL1] = LOW;
+    pulse_duration[CHANNEL1] = current_time - timer[CHANNEL1];
+  }
+
+  if (PIND & (1 << PD4)) {
+    if (previous_state[CHANNEL2] == LOW) {
+      previous_state[CHANNEL2] = HIGH;
+      timer[CHANNEL2] = current_time;
+    }
+  } else if (previous_state[CHANNEL2] == HIGH) {
+    previous_state[CHANNEL2] = LOW;
+    pulse_duration[CHANNEL2] = current_time - timer[CHANNEL2];
+  }
+
+  if (PIND & (1 << PD7)) {
+    if (previous_state[CHANNEL3] == LOW) {
+      previous_state[CHANNEL3] = HIGH;
+      timer[CHANNEL3] = current_time;
+    }
+  } else if (previous_state[CHANNEL3] == HIGH) {
+    previous_state[CHANNEL3] = LOW;
+    pulse_duration[CHANNEL3] = current_time - timer[CHANNEL3];
+  }
+}
+
+// ==========================================
+// COMMUNICATION JETSON ET TÉLÉMÉTRIE
+// ==========================================
+void ecouter_jetson() {
+  if (Serial.available() > 0) {
+    String commande = Serial.readStringUntil('\n');
+    
+    int virgule1 = commande.indexOf(',');
+    int virgule2 = commande.indexOf(',', virgule1 + 1);
+
+    if (virgule1 > 0 && virgule2 > 0) {
+      jetson_dir = commande.substring(0, virgule1).toInt();
+      jetson_acc = commande.substring(virgule1 + 1, virgule2).toInt();
+      jetson_mode = commande.substring(virgule2 + 1).toInt();
+      
+      dernier_message_jetson = millis();
+      jetson_actif = true;
+    }
+  }
+
+  if (millis() - dernier_message_jetson > 1000) {
+    jetson_actif = false;
+  }
+}
+
+void envoyer_telemetrie() {
+  if (millis() - dernier_envoi_telemetrie > 200) {
+    
+    Wire.beginTransmission(MPU9250_ADDR);
+    Wire.write(0x3B);
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)MPU9250_ADDR, (uint8_t)14, (uint8_t)true);
+
+    int16_t ax = Wire.read() << 8 | Wire.read();
+    int16_t ay = Wire.read() << 8 | Wire.read();
+    int16_t az = Wire.read() << 8 | Wire.read();
+    for(int i=0; i<8; i++) Wire.read(); 
+
+    acc_x = (ax / 16384.0) * 9.81;
+    acc_y = (ay / 16384.0) * 9.81;
+
+    Wire.beginTransmission(AK8963_ADDR);
+    Wire.write(0x03); 
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)AK8963_ADDR, (uint8_t)7, (uint8_t)true);
+
+    int16_t mx = 0, my = 0, mz = 0;
+    if (Wire.available() >= 7) {
+      mx = Wire.read() | (Wire.read() << 8); 
+      my = Wire.read() | (Wire.read() << 8);
+      mz = Wire.read() | (Wire.read() << 8);
+      Wire.read(); 
+    }
+
+    float cap_float = atan2(my, mx) * 180.0 / PI;
+    if (cap_float < 0) cap_float += 360.0;
+    cap_robot = (int)cap_float;
+
+    Serial.print(cap_robot);
+    Serial.print(",");
+    Serial.print(acc_x);
+    Serial.print(",");
+    Serial.println(acc_y); 
+
+    dernier_envoi_telemetrie = millis();
+  }
+}
+
+void writeRegister(uint8_t device, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(device);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
